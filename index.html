@@ -251,7 +251,8 @@ textarea.field{line-height:1.6}
   <label><input type="checkbox" id="workGuard"> 업무 노트를 Claude로 보내기 전에 매번 확인</label>
   <div class="row" style="margin-top:16px"><button class="btn" id="saveSettings">저장</button><button class="btn ghost" id="closeSettings">닫기</button></div>
   <label>받아쓰기 진단</label>
-  <p class="hint" style="margin-top:0">받아쓰기가 끊기거나 빠질 때, 아이폰이 받아쓰기를 언제 멈추고 다시 켰는지 기록한 내용입니다. 말한 내용은 들어 있지 않습니다. 복사해서 Claude에게 보내 주시면 원인을 찾는 데 씁니다.</p>
+  <p class="hint" style="margin-top:0">받아쓰기가 끊기거나 빠질 때, 아이폰이 받아쓰기를 언제 멈추고 다시 켰는지 기록한 내용입니다. 아래 시험용 항목을 켜지 않으면 말한 내용은 들어 있지 않습니다. 복사해서 Claude에게 보내 주시면 원인을 찾는 데 씁니다.</p>
+  <label style="font-weight:400;color:var(--ink)"><input type="checkbox" id="diagText"> 시험용: 받아쓴 글자까지 기록 (아이폰이 넘겨준 글자를 매번 남겨, 어디서 사라지는지 보입니다. 업무 회의에서는 끄세요)</label>
   <div class="row"><button class="btn ghost" id="copyDiag">진단 기록 복사</button><button class="btn ghost" id="clearDiag">지우기</button><span class="hint" id="diagCount"></span></div>
 </div></div>
 
@@ -413,9 +414,12 @@ function startSR(fromTap){
   // result list mid-session, so finals are matched by text, not by position.
   let doneTexts = [];
   const t0 = performance.now(); let nFinal = 0;
+  // Per-session counters for the diagnostic log (no speech content unless the user opts in).
+  const S = R.sess = { t0, ev:0, fin:0, repl:0, rescued:0, maxI:0, maxGap:0, last:t0, fromTap, done:false };
   rec.onstart = () => diag(`시작 (${fromTap ? '버튼' : '자동 재시작'})`);
   rec.onresult = e => {
     if (!fromTap) setRecNotice('');
+    const now = performance.now(); S.ev++; S.maxGap = Math.max(S.maxGap, now - S.last); S.last = now;
     const finals = [], interims = [];
     for (let i = 0; i < e.results.length; i++) {
       const r = e.results[i], txt = ((r[0] && r[0].transcript) || '').trim();
@@ -424,16 +428,26 @@ function startSR(fromTap){
     let k = 0; while (k < doneTexts.length && k < finals.length && doneTexts[k] === finals[k]) k++;
     let fresh;
     if (k === doneTexts.length) fresh = finals.slice(k);
-    else { diag(`결과 목록 재시작 (이전 ${doneTexts.length}개 → ${finals.length}개)`); fresh = finals.filter(t => !doneTexts.includes(t)); }
+    else { if (finals.length) diag(`결과 목록 재시작 (이전 ${doneTexts.length}개 → ${finals.length}개)`); fresh = finals.filter(t => !doneTexts.includes(t)); }
     doneTexts = finals.slice();
     const interim = interims.join(' ');
-    // Safari sometimes drops an unfinished sentence and starts a new one without ever finalizing it.
-    if (!fresh.length && R.interim && R.interim.length >= 6) {
-      const prev = R.interim;
-      const dropped = !interim ? false : (!interim.startsWith(prev.slice(0, 4)) && interim.length < prev.length * 0.7);
-      if (dropped) { diag(`버려질 뻔한 미완성 문장 보존 (${prev.length}자)`); R.interim = ''; commit(prev, true); }
+    if (settings.diagText) diag(`  결과 #${S.ev} 목록${e.results.length} 확정+${fresh.length}${fresh.length ? ' ' + JSON.stringify(fresh.map(f => f.slice(0, 60))) : ''} 미확정 "${interim.slice(0, 80)}"`);
+    S.maxI = Math.max(S.maxI, interim.length);
+    // Safari can throw away an unfinished sentence: the next result no longer continues it,
+    // and the new final (if any) does not contain it either. Keep the old text instead of losing it.
+    const prev = R.interim;
+    if (prev && prev.length >= 4) {
+      const head = prev.slice(0, 3);
+      const continues = interim.startsWith(head) || fresh.some(f => f.includes(prev) || f.startsWith(head) || prev.includes(f));
+      if (!continues) {
+        S.repl++;
+        if (!fresh.length || !fresh.some(f => f.length >= prev.length * 0.8)) {
+          S.rescued++; diag(`사라질 뻔한 미완성 문장 보존 (${prev.length}자)`);
+          R.interim = ''; commit(prev, true);
+        }
+      }
     }
-    for (const f of fresh) { nFinal++; commit(f); }
+    for (const f of fresh) { nFinal++; S.fin++; commit(f); }
     if (interim && R.interimStart === null) R.interimStart = elapsed();
     R.interim = interim; renderRec();
   };
@@ -457,7 +471,7 @@ function startSR(fromTap){
     setRecNotice(`받아쓰기 오류: ${code}`, true);
   };
   rec.onend = () => {
-    diag(`종료 (${((performance.now() - t0) / 1000).toFixed(1)}초 동안 문장 ${nFinal}개${R.interim ? ', 미완성 1개 저장' : ''})`);
+    sessSummary('아이폰이 끝냄');
     if (R.interim) { commit(R.interim); R.interim = ''; renderRec(); }
     if (R.rec === rec) R.rec = null;
     // Restart right away: every second of delay is speech that is not transcribed.
@@ -473,7 +487,12 @@ function needTap(msg, warn){
   if (R.interim) { commit(R.interim); R.interim = ''; }
   $('#pauseBtn').textContent = '이어서 받아쓰기'; setLive(); setRecNotice(msg, warn !== false); renderRec();
 }
-function stopSR(){ if (R.rec) { const r = R.rec; R.rec = null; try { r.onend = null; r.stop(); } catch {} } if (R.interim) { commit(R.interim); R.interim=''; } }
+function stopSR(){ if (R.rec) { sessSummary('앱이 멈춤'); const r = R.rec; R.rec = null; try { r.onend = null; r.stop(); } catch {} } if (R.interim) { commit(R.interim); R.interim=''; } }
+function sessSummary(why){
+  const S = R.sess; if (!S || S.done) return; S.done = true;
+  const sec = x => (x / 1000).toFixed(1);
+  diag(`종료 · ${why} · ${sec(performance.now() - S.t0)}초 · 결과 ${S.ev}회 · 확정 문장 ${S.fin}개 · 이어지지 않은 결과 ${S.repl}회(보존 ${S.rescued}) · 미확정 최대 ${S.maxI}자 · 결과 사이 최대 ${sec(S.maxGap)}초${R.interim ? ' · 미확정 1개 저장' : ''}`);
+}
 
 function commit(txt, rescued){
   const t = R.interimStart !== null ? R.interimStart : elapsed();
@@ -494,7 +513,7 @@ function commit(txt, rescued){
 /* ---------- speech diagnostics (kept on this phone only) ---------- */
 const DIAG_KEY = 'jbr.diag.v1';
 let DIAG = store.get(DIAG_KEY, []);
-function diag(msg){ DIAG.push(`${new Date().toTimeString().slice(0, 8)} [${fmt(elapsed())}] ${msg}`); if (DIAG.length > 300) DIAG = DIAG.slice(-300); }
+function diag(msg){ DIAG.push(`${new Date().toTimeString().slice(0, 8)} [${fmt(elapsed())}] ${msg}`); if (DIAG.length > 1500) DIAG = DIAG.slice(-1500); }
 function saveDiag(){ store.set(DIAG_KEY, DIAG); }
 function saveDraft(){ if (R.on) store.set(DRAFT_KEY, { lines: R.lines, elapsed: elapsed(), title: $('#recTitle').value, kind: R.kind, started: R.started }); }
 $('#recTitle').addEventListener('input', saveDraft);
@@ -998,6 +1017,8 @@ const diagCount = () => { $('#diagCount').textContent = DIAG.length ? `${DIAG.le
 $('#openSettings').addEventListener('click', diagCount);
 $('#copyDiag').onclick = () => { saveDiag(); copyText(`적바림 받아쓰기 진단\n${navigator.userAgent}\n\n${DIAG.join('\n') || '(기록 없음)'}`); };
 $('#clearDiag').onclick = () => { DIAG = []; saveDiag(); diagCount(); };
+$('#openSettings').addEventListener('click', () => { $('#diagText').checked = !!settings.diagText; });
+$('#diagText').onchange = () => { settings.diagText = $('#diagText').checked; store.set(SET_KEY, settings); };
 $('#saveSettings').onclick = () => {
   Object.assign(settings, { apiKey: $('#apiKey').value.trim(), oaKey: $('#oaKey').value.trim(), model: $('#model').value, glossary: $('#glossary').value, custom: $('#custom').value, workGuard: $('#workGuard').checked });
   store.set(SET_KEY, settings); $('#settings').hidden = true; toast('설정을 저장했습니다'); if (cur && !$('#note').hidden) renderSum();
